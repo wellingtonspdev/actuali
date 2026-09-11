@@ -1,0 +1,107 @@
+name: Unsigned iOS Artifact
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Actuali/**"
+      - ".github/workflows/unsigned-ios-artifact.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ios-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-package:
+    name: Build, test, and package unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report Xcode toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Resolve Swift Package Manager dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Actuali/Actuali.xcodeproj \
+            -scheme Actuali \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+
+      - name: Select iOS 26 simulator
+        id: sim
+        run: |
+          SIM_ID=$(xcrun simctl list devices available --json \
+            | jq -r '[.devices | to_entries[] | select(.key | contains("iOS-26")) | .value[] | select(.name | startswith("iPhone"))][0].udid')
+          if [ -z "$SIM_ID" ] || [ "$SIM_ID" = "null" ]; then
+            echo "No available iOS 26 iPhone simulator on this runner" >&2
+            exit 1
+          fi
+          echo "id=$SIM_ID" >> "$GITHUB_OUTPUT"
+
+      # Simulator builds are automatically ad-hoc signed by Xcode. This does
+      # not require a certificate or provisioning profile, and preserves the
+      # Keychain entitlement required by the unit-test host.
+      - name: Build and run unit tests on iOS 26
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Actuali/Actuali.xcodeproj \
+            -scheme Actuali \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.id }}" \
+            -testLanguage en \
+            -testRegion US \
+            -skip-testing:ActualiUITests \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            | xcbeautify --quiet
+
+      # Device builds are intentionally unsigned. The resulting IPA is not
+      # installable as-is; AltStore/Sideloadly must sign the app, frameworks,
+      # and widget extension with the installer's own Apple account.
+      - name: Build unsigned device app
+        run: |
+          xcodebuild build \
+            -project Actuali/Actuali.xcodeproj \
+            -scheme Actuali \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package re-signable IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/Actuali.app"
+          PACKAGE_ROOT="$RUNNER_TEMP/ActualiPackage"
+
+          test -d "$APP_PATH"
+          test -d "$APP_PATH/PlugIns/ActualiWidgets.appex"
+
+          mkdir -p "$PACKAGE_ROOT/Payload"
+          ditto "$APP_PATH" "$PACKAGE_ROOT/Payload/Actuali.app"
+          find "$PACKAGE_ROOT/Payload" -name _CodeSignature -type d -prune -exec rm -rf {} +
+          find "$PACKAGE_ROOT/Payload" -name embedded.mobileprovision -type f -delete
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$PACKAGE_ROOT/Payload" \
+            "$GITHUB_WORKSPACE/Actuali-unsigned.ipa"
+          unzip -l "$GITHUB_WORKSPACE/Actuali-unsigned.ipa" | grep -E 'Payload/Actuali.app/|PlugIns/ActualiWidgets.appex/'
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v5
+        with:
+          name: Actuali-unsigned-ipa-${{ github.sha }}
+          path: Actuali-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
